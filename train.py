@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 import time
 from pathlib import Path
 
@@ -10,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
+from torch.utils.data import DataLoader, Dataset
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from tqdm import trange
@@ -20,73 +20,106 @@ WINDOW = 512
 BOT_ID, EOS_ID, USER_ID, PAD_ID = 4, 2, 3, 0
 
 
-def batch_from_memmap(data: np.memmap, batch_size: int, phase: str, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    if phase == "pretrain":
-        starts = np.random.randint(0, len(data) - WINDOW - 1, size=batch_size)
-        rows = np.stack([data[start:start + WINDOW + 1] for start in starts])
-        x, y = rows[:, :-1], rows[:, 1:].astype(np.int64, copy=True)
-    else:
-        starts = np.random.randint(0, len(data) // WINDOW, size=batch_size) * WINDOW
-        rows = np.stack([data[start:start + WINDOW] for start in starts])
-        x, targets = rows[:, :-1], rows[:, 1:]
-        y = targets.astype(np.int64, copy=True)
-        for row_index, row in enumerate(rows):
+class TokenDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
+    """Random-access token windows backed by one RAM-resident uint16 array."""
+
+    def __init__(self, path: str, phase: str) -> None:
+        self.phase = phase
+        self.data = np.fromfile(path, dtype=np.uint16)
+        if phase == "pretrain":
+            self.length = len(self.data) - WINDOW
+        else:
+            self.length = len(self.data) // WINDOW
+        if self.length <= 0:
+            raise ValueError(f"{path} does not contain enough tokens for {phase} training.")
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.phase == "pretrain":
+            row = self.data[index:index + WINDOW + 1]
+        else:
+            start = index * WINDOW
+            row = self.data[start:start + WINDOW]
+
+        x = torch.from_numpy(row[:-1].astype(np.int64, copy=True))
+        y = row[1:].astype(np.int64, copy=True)
+        if self.phase == "sft":
             active = False
             for token_index, token in enumerate(row[1:]):
                 if token == BOT_ID:
                     active = True
-                    y[row_index, token_index] = -100
+                    y[token_index] = -100
                 elif active:
                     if token == PAD_ID:
                         active = False
-                        y[row_index, token_index] = -100
+                        y[token_index] = -100
                     else:
-                        y[row_index, token_index] = int(token)
                         if token == EOS_ID:
                             active = False
                 else:
-                    y[row_index, token_index] = -100
-    return torch.from_numpy(x.astype(np.int64, copy=False)).to(device), torch.from_numpy(y.astype(np.int64, copy=False)).to(device)
+                    y[token_index] = -100
+        return x, torch.from_numpy(y)
 
 
-def evaluate(model: Llama3Mini, tokenizer: Tokenizer, device: torch.device) -> None:
+def unwrap_model(model: torch.nn.Module) -> Llama3Mini:
+    base_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    if not isinstance(base_model, Llama3Mini):
+        raise TypeError(f"Expected Llama3Mini, got {type(base_model).__name__}")
+    return base_model
+
+
+def evaluate(model: torch.nn.Module, tokenizer: Tokenizer, device: torch.device) -> None:
     prompts = ["Hi! Who are you?", "I am exhausted from college today.", "What are you doing right now?"]
-    model.eval()
+    base_model = unwrap_model(model)
+    base_model.eval()
     for prompt in prompts:
         encoded = tokenizer.encode(f"<|bos|><|user|>{prompt}<|bot|>", add_special_tokens=False).ids
-        result = model.generate(torch.tensor([encoded], device=device))
+        result = base_model.generate(torch.tensor([encoded], device=device))
         print("BOT:", tokenizer.decode(result[0].tolist(), skip_special_tokens=False))
 
 
 def main(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = Tokenizer.from_file("tokenizer.json")
-    data = np.memmap("pretrain.bin" if args.phase == "pretrain" else "sft_waifu.bin",
-                     dtype=np.uint16, mode="r")
-    model = Llama3Mini(ModelConfig()).to(device)
+    dataset = TokenDataset("pretrain.bin" if args.phase == "pretrain" else "sft_waifu.bin", args.phase)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,
+                        pin_memory=True, persistent_workers=True, drop_last=True)
+    batches = iter(loader)
+    model: torch.nn.Module = Llama3Mini(ModelConfig()).to(device)
+    if torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
     optimizer = AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
     scaler = GradScaler("cuda", enabled=device.type == "cuda")
     start_step = 0
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint["model"])
+        unwrap_model(model).load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         start_step = int(checkpoint.get("step", 0))
     warmup = max(1, int(args.max_steps * 0.05))
     best_loss = float("inf")
+    last_logged_loss = float("inf")
     Path("checkpoints").mkdir(exist_ok=True)
     started = time.perf_counter()
     for step in trange(start_step, args.max_steps, desc=args.phase):
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        loss_value = 0.0
+        loss_sum = torch.zeros((), device=device)
         for _ in range(args.grad_accum):
-            x, y = batch_from_memmap(data, args.batch_size, args.phase, device)
+            try:
+                x, y = next(batches)
+            except StopIteration:
+                batches = iter(loader)
+                x, y = next(batches)
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
             with autocast("cuda", dtype=torch.float16, enabled=device.type == "cuda"):
                 logits = model(x)
                 loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=-100)
             scaler.scale(loss / args.grad_accum).backward()
-            loss_value += float(loss.detach())
+            loss_sum += loss.detach()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         progress = step + 1
@@ -98,14 +131,15 @@ def main(args: argparse.Namespace) -> None:
         scaler.step(optimizer)
         scaler.update()
         if progress % 50 == 0:
-            avg_loss = loss_value / args.grad_accum
+            avg_loss = (loss_sum / args.grad_accum).item()
+            last_logged_loss = avg_loss
             tok_sec = (progress * args.batch_size * args.grad_accum * (WINDOW - 1)) / max(1e-6, time.perf_counter() - started)
             print(f"{progress} | {avg_loss:.4f} | {math.exp(min(avg_loss, 20)):.3f} | {lr:.6g} | {tok_sec:.1f}")
         if progress % 500 == 0 or progress == args.max_steps:
-            state = {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": progress}
+            state = {"model": unwrap_model(model).state_dict(), "optimizer": optimizer.state_dict(), "step": progress}
             torch.save(state, f"checkpoints/{args.phase}_latest.pt")
-            if loss_value / args.grad_accum < best_loss:
-                best_loss = loss_value / args.grad_accum
+            if last_logged_loss < best_loss:
+                best_loss = last_logged_loss
                 torch.save(state, f"checkpoints/{args.phase}_best.pt")
             evaluate(model, tokenizer, device)
 
