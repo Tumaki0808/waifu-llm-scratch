@@ -9,9 +9,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
+from torch.utils.data import DataLoader, Dataset
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
 from tqdm import trange
 
 from model import Llama3Mini, ModelConfig
@@ -25,6 +25,7 @@ class TokenDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
 
     def __init__(self, path: str, phase: str) -> None:
         self.phase = phase
+        print(f"-> Loading {path} into RAM...")
         self.data = np.fromfile(path, dtype=np.uint16)
         if phase == "pretrain":
             self.length = len(self.data) - WINDOW
@@ -32,6 +33,7 @@ class TokenDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
             self.length = len(self.data) // WINDOW
         if self.length <= 0:
             raise ValueError(f"{path} does not contain enough tokens for {phase} training.")
+        print(f"-> Dataset loaded successfully! Total windows: {self.length:,}")
 
     def __len__(self) -> int:
         return self.length
@@ -63,97 +65,98 @@ class TokenDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         return x, torch.from_numpy(y)
 
 
-def unwrap_model(model: torch.nn.Module) -> Llama3Mini:
-    base_model = model.module if isinstance(model, torch.nn.DataParallel) else model
-    if not isinstance(base_model, Llama3Mini):
-        raise TypeError(f"Expected Llama3Mini, got {type(base_model).__name__}")
-    return base_model
-
-
 def evaluate(model: torch.nn.Module, tokenizer: Tokenizer, device: torch.device) -> None:
     prompts = ["Hi! Who are you?", "I am exhausted from college today.", "What are you doing right now?"]
-    base_model = unwrap_model(model)
-    base_model.eval()
+    model.eval()
     for prompt in prompts:
         encoded = tokenizer.encode(f"<|bos|><|user|>{prompt}<|bot|>", add_special_tokens=False).ids
-        result = base_model.generate(torch.tensor([encoded], device=device))
+        result = model.generate(torch.tensor([encoded], device=device))
         print("BOT:", tokenizer.decode(result[0].tolist(), skip_special_tokens=False))
 
 
 def main(args: argparse.Namespace) -> None:
+    print("-> Initializing device...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"-> Using device: {device}")
+
+    print("-> Loading tokenizer.json...")
     tokenizer = Tokenizer.from_file("tokenizer.json")
+
+    print(f"-> Setting up dataset for phase: {args.phase}")
     dataset = TokenDataset("pretrain.bin" if args.phase == "pretrain" else "sft_waifu.bin", args.phase)
     
-    # num_workers=0 prevents Kaggle freezing deadlocks
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0,
                         pin_memory=True, drop_last=True)
     batches = iter(loader)
-    
-    model: torch.nn.Module = Llama3Mini(ModelConfig()).to(device)
-    if torch.cuda.device_count() > 1:
-        model = torch.nn.DataParallel(model)
-        
+
+    print("-> Initializing Llama3Mini model structure...")
+    model = Llama3Mini(ModelConfig()).to(device)
+
+    print("-> Setting up optimizer and scaler...")
     optimizer = AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
     scaler = GradScaler("cuda", enabled=device.type == "cuda")
-    
+
     start_step = 0
     if args.resume:
+        print(f"-> Resuming checkpoint from {args.resume}...")
         checkpoint = torch.load(args.resume, map_location=device)
-        unwrap_model(model).load_state_dict(checkpoint["model"])
+        model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         start_step = int(checkpoint.get("step", 0))
-        
+        print(f"-> Resumed successfully at step {start_step}!")
+
     warmup = max(1, int(args.max_steps * 0.05))
     best_loss = float("inf")
     last_logged_loss = float("inf")
     Path("checkpoints").mkdir(exist_ok=True)
-    
+
+    print("-> Starting training loop now...")
     started = time.perf_counter()
+    
     for step in trange(start_step, args.max_steps, desc=args.phase):
         model.train()
         optimizer.zero_grad(set_to_none=True)
         loss_sum = torch.zeros((), device=device)
-        
+
         for _ in range(args.grad_accum):
             try:
                 x, y = next(batches)
             except StopIteration:
                 batches = iter(loader)
                 x, y = next(batches)
-                
+
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            
+
             with autocast("cuda", dtype=torch.float16, enabled=device.type == "cuda"):
                 logits = model(x)
                 loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=-100)
-                
+
             scaler.scale(loss / args.grad_accum).backward()
             loss_sum += loss.detach()
-            
+
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        
+
         progress = step + 1
         scale = min(1.0, progress / warmup) if progress <= warmup else 0.5 * (
             1 + math.cos(math.pi * (progress - warmup) / max(1, args.max_steps - warmup)))
         lr = args.lr * scale
-        
+
         for group in optimizer.param_groups:
             group["lr"] = lr
-            
+
         scaler.step(optimizer)
         scaler.update()
-        
+
         if progress % 50 == 0:
             avg_loss = (loss_sum / args.grad_accum).item()
             last_logged_loss = avg_loss
             tok_sec = (progress * args.batch_size * args.grad_accum * (WINDOW - 1)) / max(1e-6, time.perf_counter() - started)
             print(f"{progress} | {avg_loss:.4f} | {math.exp(min(avg_loss, 20)):.3f} | {lr:.6g} | {tok_sec:.1f}")
-            
+
         if progress % 500 == 0 or progress == args.max_steps:
-            state = {"model": unwrap_model(model).state_dict(), "optimizer": optimizer.state_dict(), "step": progress}
+            state = {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": progress}
             torch.save(state, f"checkpoints/{args.phase}_latest.pt")
             if last_logged_loss < best_loss:
                 best_loss = last_logged_loss
