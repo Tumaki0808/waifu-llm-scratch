@@ -24,7 +24,7 @@ def batch_from_memmap(data: np.memmap, batch_size: int, phase: str, device: torc
     if phase == "pretrain":
         starts = np.random.randint(0, len(data) - WINDOW - 1, size=batch_size)
         rows = np.stack([data[start:start + WINDOW + 1] for start in starts])
-        x, y = rows[:, :-1], rows[:, 1:]
+        x, y = rows[:, :-1], rows[:, 1:].astype(np.int64, copy=True)
     else:
         starts = np.random.randint(0, len(data) // WINDOW, size=batch_size) * WINDOW
         rows = np.stack([data[start:start + WINDOW] for start in starts])
@@ -46,7 +46,7 @@ def batch_from_memmap(data: np.memmap, batch_size: int, phase: str, device: torc
                             active = False
                 else:
                     y[row_index, token_index] = -100
-    return torch.from_numpy(x.astype(np.int64)).to(device), torch.from_numpy(y).to(device)
+    return torch.from_numpy(x.astype(np.int64, copy=False)).to(device), torch.from_numpy(y.astype(np.int64, copy=False)).to(device)
 
 
 def evaluate(model: Llama3Mini, tokenizer: Tokenizer, device: torch.device) -> None:
