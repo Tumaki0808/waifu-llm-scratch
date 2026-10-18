@@ -65,6 +65,13 @@ class TokenDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         return x, torch.from_numpy(y)
 
 
+def unwrap_model(model: torch.nn.Module) -> Llama3Mini:
+    base_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    if not isinstance(base_model, Llama3Mini):
+        raise TypeError(f"Expected Llama3Mini, got {type(base_model).__name__}")
+    return base_model
+
+
 def evaluate(model: torch.nn.Module, tokenizer: Tokenizer, device: torch.device) -> None:
     prompts = ["Hi! Who are you?", "I am exhausted from college today.", "What are you doing right now?"]
     model.eval()
@@ -100,10 +107,20 @@ def main(args: argparse.Namespace) -> None:
     if args.resume:
         print(f"-> Resuming checkpoint from {args.resume}...")
         checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        start_step = int(checkpoint.get("step", 0))
-        print(f"-> Resumed successfully at step {start_step}!")
+        
+        state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
+        unwrap_model(model).load_state_dict(state_dict)
+        
+        # Automatically detect if we are starting SFT from a pretrain checkpoint
+        is_pretrain_transition = (args.phase == "sft" and int(checkpoint.get("step", 0)) >= 5000)
+        
+        if is_pretrain_transition:
+            print("-> Detected pretraining checkpoint for SFT phase. Starting SFT fresh at step 0 with SFT learning rate!")
+            start_step = 0
+        else:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            start_step = int(checkpoint.get("step", 0))
+            print(f"-> Resumed successfully at step {start_step}!")
 
     warmup = max(1, int(args.max_steps * 0.05))
     best_loss = float("inf")
@@ -156,7 +173,7 @@ def main(args: argparse.Namespace) -> None:
             print(f"{progress} | {avg_loss:.4f} | {math.exp(min(avg_loss, 20)):.3f} | {lr:.6g} | {tok_sec:.1f}")
 
         if progress % 500 == 0 or progress == args.max_steps:
-            state = {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": progress}
+            state = {"model": unwrap_model(model).state_dict(), "optimizer": optimizer.state_dict(), "step": progress}
             torch.save(state, f"checkpoints/{args.phase}_latest.pt")
             if last_logged_loss < best_loss:
                 best_loss = last_logged_loss
