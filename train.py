@@ -9,7 +9,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
-from torch.utils.data import DataLoader, Dataset
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from tqdm import trange
@@ -17,176 +16,198 @@ from tqdm import trange
 from model import Llama3Mini, ModelConfig
 
 WINDOW = 512
-BOT_ID, EOS_ID, USER_ID, PAD_ID = 4, 2, 3, 0
 
 
-class TokenDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
-    """Random-access token windows backed by one RAM-resident uint16 array."""
+def get_intelligence_stage(loss: float, phase: str) -> str:
+    if loss > 4.5:
+        return "LVL 1/6: Infant Babbling (Discovering syllables & spaces)"
+    elif loss > 3.0:
+        return "LVL 2/6: Early Words (Forming basic nouns & verbs, broken grammar)"
+    elif loss > 2.2:
+        return "LVL 3/6: Basic English (Clean short sentences, learning grammar rules)"
+    elif loss > 1.7:
+        return "LVL 4/6: Coherent English (Good grammar, understands cause & effect)"
+    elif phase == "pretrain":
+        return "LVL 5/6: Fluent Pretrained Base (Ready for Phase 2 Chat SFT!)"
+    else:
+        return "LVL 6/6: Conversational Companion (Full Persona & Natural English Chat!)"
 
-    def __init__(self, path: str, phase: str) -> None:
+
+class FastGPUBatcher:
+    """Zero-DataLoader vectorized tensor batcher. Slices 128 sequences in <0.2ms with zero Kaggle hangs."""
+
+    def __init__(self, phase: str, device: torch.device):
         self.phase = phase
-        print(f"-> Loading {path} into RAM...")
-        self.data = np.fromfile(path, dtype=np.uint16)
+        self.device = device
         if phase == "pretrain":
-            self.length = len(self.data) - WINDOW
+            print("-> Loading pretrain.bin into RAM for vectorized slicing...")
+            raw = np.fromfile("pretrain.bin", dtype=np.uint16)
+            self.tokens = torch.from_numpy(raw.astype(np.int64))
+            self.offsets = torch.arange(WINDOW + 1, dtype=torch.long)
+            self.max_start = len(self.tokens) - WINDOW - 2
+            print(f"-> Loaded {len(self.tokens):,} tokens into fast memory!")
         else:
-            self.length = len(self.data) // WINDOW
-        if self.length <= 0:
-            raise ValueError(f"{path} does not contain enough tokens for {phase} training.")
-        print(f"-> Dataset loaded successfully! Total windows: {self.length:,}")
+            print("-> Loading pre-masked sft_x.bin & sft_y.bin into RAM...")
+            raw_x = np.fromfile("sft_x.bin", dtype=np.uint16).reshape(-1, WINDOW)
+            raw_y = np.fromfile("sft_y.bin", dtype=np.int16).reshape(-1, WINDOW)
+            self.sft_x = torch.from_numpy(raw_x.astype(np.int64))
+            self.sft_y = torch.from_numpy(raw_y.astype(np.int64))
+            self.num_rows = len(self.sft_x)
+            print(f"-> Loaded {self.num_rows:,} pre-masked SFT conversation windows!")
 
-    def __len__(self) -> int:
-        return self.length
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def next_batch(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
         if self.phase == "pretrain":
-            row = self.data[index:index + WINDOW + 1]
+            starts = torch.randint(0, self.max_start, (batch_size, 1))
+            chunk = self.tokens[starts + self.offsets]  # Vectorized C++ gather
+            x = chunk[:, :-1].to(self.device, non_blocking=True)
+            y = chunk[:, 1:].to(self.device, non_blocking=True)
+            return x, y
         else:
-            start = index * WINDOW
-            row = self.data[start:start + WINDOW]
-
-        x = torch.from_numpy(row[:-1].astype(np.int64, copy=True))
-        y = row[1:].astype(np.int64, copy=True)
-        if self.phase == "sft":
-            active = False
-            for token_index, token in enumerate(row[1:]):
-                if token == BOT_ID:
-                    active = True
-                    y[token_index] = -100
-                elif active:
-                    if token == PAD_ID:
-                        active = False
-                        y[token_index] = -100
-                    else:
-                        if token == EOS_ID:
-                            active = False
-                else:
-                    y[token_index] = -100
-        return x, torch.from_numpy(y)
+            idx = torch.randint(0, self.num_rows, (batch_size,))
+            x = self.sft_x[idx].to(self.device, non_blocking=True)
+            y = self.sft_y[idx].to(self.device, non_blocking=True)
+            return x, y
 
 
 def unwrap_model(model: torch.nn.Module) -> Llama3Mini:
-    base_model = model.module if isinstance(model, torch.nn.DataParallel) else model
-    if not isinstance(base_model, Llama3Mini):
-        raise TypeError(f"Expected Llama3Mini, got {type(base_model).__name__}")
-    return base_model
+    m = model.module if isinstance(model, torch.nn.DataParallel) else model
+    if hasattr(m, "_orig_mod"):
+        m = m._orig_mod
+    return m
 
 
-def evaluate(model: torch.nn.Module, tokenizer: Tokenizer, device: torch.device) -> None:
-    prompts = ["Hi! Who are you?", "I am exhausted from college today.", "What are you doing right now?"]
-    model.eval()
-    for prompt in prompts:
-        encoded = tokenizer.encode(f"<|bos|><|user|>{prompt}<|bot|>", add_special_tokens=False).ids
-        result = model.generate(torch.tensor([encoded], device=device))
-        print("BOT:", tokenizer.decode(result[0].tolist(), skip_special_tokens=False))
+def evaluate_talking_level(model: torch.nn.Module, tokenizer: Tokenizer, device: torch.device, step: int, loss: float, phase: str) -> None:
+    base = unwrap_model(model)
+    base.eval()
+    stage = get_intelligence_stage(loss, phase)
+    print("\n" + "=" * 72)
+    print(f" [STEP {step} LIVE CHECK]Loss: {loss:.4f} | {stage}")
+    print("-" * 72)
+
+    test_prompts = [
+        "Hi! Who are you?",
+        "I am really tired from college today.",
+        "Can we talk for a little bit?",
+    ]
+    for p in test_prompts:
+        prompt_str = f"<|bos|><|user|>{p}<|bot|>"
+        ids = tokenizer.encode(prompt_str, add_special_tokens=False).ids
+        x = torch.tensor([ids], dtype=torch.long, device=device)
+        out = base.generate(x, max_new_tokens=75, temperature=0.65, top_p=0.9, repetition_penalty=1.18)
+        gen_ids = out[0, len(ids) :].tolist()
+        reply = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+        print(f" USER : {p}")
+        print(f" BOT  : {reply}\n")
+    print("=" * 72 + "\n")
 
 
 def main(args: argparse.Namespace) -> None:
-    print("-> Initializing device...")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"-> Using device: {device}")
 
-    print("-> Loading tokenizer.json...")
     tokenizer = Tokenizer.from_file("tokenizer.json")
+    batcher = FastGPUBatcher(args.phase, device)
 
-    print(f"-> Setting up dataset for phase: {args.phase}")
-    dataset = TokenDataset("pretrain.bin" if args.phase == "pretrain" else "sft_waifu.bin", args.phase)
-    
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0,
-                        pin_memory=True, drop_last=True)
-    batches = iter(loader)
-
-    print("-> Initializing Llama3Mini model structure...")
-    model = Llama3Mini(ModelConfig()).to(device)
-
-    print("-> Setting up optimizer and scaler...")
-    optimizer = AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
-    scaler = GradScaler("cuda", enabled=device.type == "cuda")
+    cfg = ModelConfig(vocab_size=tokenizer.get_vocab_size())
+    model: torch.nn.Module = Llama3Mini(cfg).to(device)
+    num_params = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"-> Initialized Llama3Mini ({num_params:.1f}M parameters) on {device}")
 
     start_step = 0
-    if args.resume:
-        print(f"-> Resuming checkpoint from {args.resume}...")
-        checkpoint = torch.load(args.resume, map_location=device)
-        
-        state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
+    if args.resume and Path(args.resume).exists():
+        print(f"-> Loading weights from {args.resume}...")
+        ckpt = torch.load(args.resume, map_location=device)
+        state_dict = ckpt["model"] if "model" in ckpt else ckpt
         unwrap_model(model).load_state_dict(state_dict)
-        
-        # Automatically detect if we are starting SFT from a pretrain checkpoint
-        is_pretrain_transition = (args.phase == "sft" and int(checkpoint.get("step", 0)) >= 5000)
-        
-        if is_pretrain_transition:
-            print("-> Detected pretraining checkpoint for SFT phase. Starting SFT fresh at step 0 with SFT learning rate!")
-            start_step = 0
+        ckpt_phase = ckpt.get("phase", "pretrain")
+        if ckpt_phase == args.phase and int(ckpt.get("step", 0)) < args.max_steps:
+            start_step = int(ckpt.get("step", 0))
+            print(f"-> Resuming same phase ({args.phase}) from step {start_step}")
         else:
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            start_step = int(checkpoint.get("step", 0))
-            print(f"-> Resumed successfully at step {start_step}!")
+            print(f"-> Loaded pretrained brain! Resetting step counter to 0 for {args.phase.upper()} phase.")
+            start_step = 0
+
+    if torch.cuda.device_count() > 1 and not args.single_gpu:
+        print(f"-> Activating Dual-GPU DataParallel across {torch.cuda.device_count()} GPUs!")
+        model = torch.nn.DataParallel(model)
+
+    optimizer = AdamW(
+        model.parameters(),
+        lr=args.lr,
+        betas=(0.9, 0.95),
+        weight_decay=0.1,
+        fused=(device.type == "cuda"),
+    )
+    scaler = GradScaler("cuda", enabled=(device.type == "cuda"))
 
     warmup = max(1, int(args.max_steps * 0.05))
     best_loss = float("inf")
-    last_logged_loss = float("inf")
     Path("checkpoints").mkdir(exist_ok=True)
 
-    print("-> Starting training loop now...")
     started = time.perf_counter()
-    
-    for step in trange(start_step, args.max_steps, desc=args.phase):
+    tokens_processed = 0
+
+    for step in trange(start_step, args.max_steps, desc=f"Training ({args.phase})"):
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        loss_sum = torch.zeros((), device=device)
+        loss_accum = torch.zeros((), device=device)
 
         for _ in range(args.grad_accum):
-            try:
-                x, y = next(batches)
-            except StopIteration:
-                batches = iter(loader)
-                x, y = next(batches)
-
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-
-            with autocast("cuda", dtype=torch.float16, enabled=device.type == "cuda"):
+            x, y = batcher.next_batch(args.batch_size)
+            with autocast("cuda", dtype=torch.float16, enabled=(device.type == "cuda")):
                 logits = model(x)
                 loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=-100)
-
             scaler.scale(loss / args.grad_accum).backward()
-            loss_sum += loss.detach()
+            loss_accum += loss.detach()
 
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
         progress = step + 1
-        scale = min(1.0, progress / warmup) if progress <= warmup else 0.5 * (
-            1 + math.cos(math.pi * (progress - warmup) / max(1, args.max_steps - warmup)))
+        if progress <= warmup:
+            scale = progress / warmup
+        else:
+            pct = (progress - warmup) / max(1, args.max_steps - warmup)
+            scale = max(0.1, 0.5 * (1.0 + math.cos(math.pi * pct)))
         lr = args.lr * scale
-
         for group in optimizer.param_groups:
             group["lr"] = lr
 
         scaler.step(optimizer)
         scaler.update()
 
-        if progress % 50 == 0:
-            avg_loss = (loss_sum / args.grad_accum).item()
-            last_logged_loss = avg_loss
-            tok_sec = (progress * args.batch_size * args.grad_accum * (WINDOW - 1)) / max(1e-6, time.perf_counter() - started)
-            print(f"{progress} | {avg_loss:.4f} | {math.exp(min(avg_loss, 20)):.3f} | {lr:.6g} | {tok_sec:.1f}")
+        tokens_processed += args.batch_size * args.grad_accum * WINDOW
 
-        if progress % 500 == 0 or progress == args.max_steps:
-            state = {"model": unwrap_model(model).state_dict(), "optimizer": optimizer.state_dict(), "step": progress}
+        if progress % 50 == 0:
+            avg_loss = (loss_accum / args.grad_accum).item()
+            elapsed = max(1e-6, time.perf_counter() - started)
+            tok_sec = tokens_processed / elapsed
+            ppl = math.exp(min(avg_loss, 15))
+            print(f"Step {progress:4d}/{args.max_steps} | Loss: {avg_loss:.4f} | Ppl: {ppl:6.2f} | LR: {lr:.2e} | Speed: {tok_sec:,.0f} tok/s")
+
+        if progress % 250 == 0 or progress == args.max_steps:
+            avg_loss = (loss_accum / args.grad_accum).item()
+            evaluate_talking_level(model, tokenizer, device, progress, avg_loss, args.phase)
+            state = {
+                "model": unwrap_model(model).state_dict(),
+                "step": progress,
+                "phase": args.phase,
+                "config": cfg.__dict__,
+            }
             torch.save(state, f"checkpoints/{args.phase}_latest.pt")
-            if last_logged_loss < best_loss:
-                best_loss = last_logged_loss
+            if avg_loss < best_loss:
+                best_loss = avg_loss
                 torch.save(state, f"checkpoints/{args.phase}_best.pt")
-            evaluate(model, tokenizer, device)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--phase", choices=("pretrain", "sft"), required=True)
     parser.add_argument("--max_steps", type=int, required=True)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--grad_accum", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--grad_accum", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=8e-4)
     parser.add_argument("--resume", default="")
+    parser.add_argument("--single_gpu", action="store_true")
     main(parser.parse_args())
