@@ -118,7 +118,7 @@ class Llama3Mini(nn.Module):
         logits = self.lm_head(self.norm(x))
         if targets is not None:
             # Compute loss inside forward() so DataParallel never copies 1GB of logits across PCIe!
-            return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
+            return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-100)
         return logits
 
     @torch.inference_mode()
